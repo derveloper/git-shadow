@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# git-shadow - automatic shadow backup for local git repositories
+#
+# Creates a bare repository outside your project directory.
+# Hooks push every commit there automatically.
+# rm -rf your project? Shadow survives.
+
+set -euo pipefail
+
+SHADOW_BASE="${GIT_SHADOW_DIR:-$HOME/.git-shadows}"
+SHADOW_REMOTE="shadow"
+MARKER="# git-shadow"
+END_MARKER="# /git-shadow"
+
+die()  { echo "git-shadow: $*" >&2; exit 1; }
+info() { echo "git-shadow: $*"; }
+
+usage() {
+    cat <<'EOF'
+usage: git shadow <command> [args...]
+
+commands:
+    init [args...]    git init + enable shadow backup
+    enable            enable shadow for existing repo
+    disable           remove hooks and remote (keeps shadow repo)
+    status            show shadow state for current repo
+    list              show all shadow repos
+
+environment:
+    GIT_SHADOW_DIR    base directory for shadow repos (default: ~/.git-shadows)
+
+shell integration (add to .zshrc/.bashrc for transparent git init wrapping):
+    eval "$(git shadow shell-init)"
+EOF
+}
+
+# Resolve shadow path, handling dirname collisions via source check
+resolve_shadow() {
+    local project_dir="$1"
+    local base_name
+    base_name="$(basename "$project_dir")"
+    local name="${base_name}-shadow.git"
+    local path="${SHADOW_BASE}/${name}"
+
+    if [[ -d "$path" ]]; then
+        local stored
+        stored="$(git -C "$path" config --get shadow.source 2>/dev/null || true)"
+        if [[ -n "$stored" ]] && [[ "$stored" != "$project_dir" ]]; then
+            local hash
+            local sha_cmd="shasum"
+            command -v shasum &>/dev/null || sha_cmd="sha1sum"
+            hash="$(printf '%s' "$project_dir" | $sha_cmd | cut -c1-8)"
+            name="${base_name}-shadow-${hash}.git"
+            path="${SHADOW_BASE}/${name}"
+        fi
+    fi
+
+    echo "$path"
+}
+
+hook_code() {
+    cat <<'HOOK'
+# git-shadow
+if git remote get-url shadow &>/dev/null 2>&1; then
+    git push shadow --all --force --quiet &>/dev/null 2>&1 &
+fi
+# /git-shadow
+HOOK
+}
+
+install_hook() {
+    local hook_file="$1"
+
+    if [[ -f "$hook_file" ]] && grep -qF "$MARKER" "$hook_file"; then
+        return 0
+    fi
+
+    if [[ -f "$hook_file" ]]; then
+        printf '\n' >> "$hook_file"
+        hook_code >> "$hook_file"
+    else
+        printf '#!/usr/bin/env bash\n' > "$hook_file"
+        hook_code >> "$hook_file"
+    fi
+
+    chmod +x "$hook_file"
+}
+
+install_hooks() {
+    local hooks_dir
+    hooks_dir="$(git rev-parse --git-dir)/hooks"
+    mkdir -p "$hooks_dir"
+
+    for h in post-commit post-merge post-rewrite; do
+        install_hook "${hooks_dir}/${h}"
+    done
+}
+
+remove_hooks() {
+    local hooks_dir
+    hooks_dir="$(git rev-parse --git-dir)/hooks"
+
+    for h in post-commit post-merge post-rewrite; do
+        local f="${hooks_dir}/${h}"
+        [[ -f "$f" ]] || continue
+        grep -qF "$MARKER" "$f" || continue
+
+        # Remove our block (portable sed -i across macOS and Linux)
+        local tmp="${f}.tmp"
+        sed "/${MARKER//\//\\/}/,/${END_MARKER//\//\\/}/d" "$f" > "$tmp"
+        mv "$tmp" "$f"
+
+        # Remove hook file if only shebang left
+        local content
+        content="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null || true)"
+        if [[ -z "$content" ]] || [[ "$content" == "#!/usr/bin/env bash" ]]; then
+            rm -f "$f"
+        fi
+    done
+}
+
+enable_shadow() {
+    local project_dir
+    project_dir="$(pwd)"
+    local shadow
+    shadow="$(resolve_shadow "$project_dir")"
+
+    if [[ ! -d "$shadow" ]]; then
+        mkdir -p "$SHADOW_BASE"
+        git init --bare "$shadow" --quiet
+        info "created $shadow"
+    fi
+
+    git -C "$shadow" config shadow.source "$project_dir"
+
+    if git remote get-url "$SHADOW_REMOTE" &>/dev/null 2>&1; then
+        git remote set-url "$SHADOW_REMOTE" "$shadow"
+    else
+        git remote add "$SHADOW_REMOTE" "$shadow"
+    fi
+
+    install_hooks
+    info "enabled ($(basename "$shadow"))"
+
+    if git rev-parse HEAD &>/dev/null 2>&1; then
+        git push "$SHADOW_REMOTE" --all --force --quiet 2>/dev/null || true
+        info "initial push done"
+    fi
+}
+
+cmd_init() {
+    local repo_dir=""
+    local is_bare=false
+
+    for arg in "$@"; do
+        case "$arg" in
+            --bare) is_bare=true ;;
+            -*) ;;
+            *) repo_dir="$arg" ;;
+        esac
+    done
+
+    command git init "$@"
+
+    if $is_bare; then
+        info "skipping bare repository"
+        return
+    fi
+
+    local target
+    target="$(cd "${repo_dir:-.}" && pwd)"
+    (cd "$target" && enable_shadow)
+}
+
+cmd_enable() {
+    git rev-parse --git-dir &>/dev/null || die "not a git repository"
+    enable_shadow
+}
+
+cmd_disable() {
+    git rev-parse --git-dir &>/dev/null || die "not a git repository"
+    remove_hooks
+
+    if git remote get-url "$SHADOW_REMOTE" &>/dev/null 2>&1; then
+        local url
+        url="$(git remote get-url "$SHADOW_REMOTE")"
+        git remote remove "$SHADOW_REMOTE"
+        info "disabled (shadow repo kept at $url)"
+    else
+        info "no shadow remote found"
+    fi
+}
+
+cmd_status() {
+    git rev-parse --git-dir &>/dev/null || die "not a git repository"
+
+    if ! git remote get-url "$SHADOW_REMOTE" &>/dev/null 2>&1; then
+        info "not active"
+        return
+    fi
+
+    local url
+    url="$(git remote get-url "$SHADOW_REMOTE")"
+    info "active"
+    echo "  remote: $url"
+
+    if [[ -d "$url" ]]; then
+        local size
+        size="$(du -sh "$url" 2>/dev/null | cut -f1 | xargs)"
+        echo "  size:   ${size}"
+    fi
+
+    local hooks_dir
+    hooks_dir="$(git rev-parse --git-dir)/hooks"
+    local installed=""
+    for h in post-commit post-merge post-rewrite; do
+        if [[ -f "${hooks_dir}/${h}" ]] && grep -qF "$MARKER" "${hooks_dir}/${h}"; then
+            installed="${installed} ${h}"
+        fi
+    done
+    echo "  hooks: ${installed:- none}"
+}
+
+cmd_list() {
+    if [[ ! -d "$SHADOW_BASE" ]]; then
+        info "no shadow repos (${SHADOW_BASE} does not exist)"
+        return
+    fi
+
+    local found=false
+    for shadow in "$SHADOW_BASE"/*.git; do
+        [[ -d "$shadow" ]] || continue
+        found=true
+
+        local source
+        source="$(git -C "$shadow" config --get shadow.source 2>/dev/null || echo "?")"
+        local name
+        name="$(basename "$shadow")"
+        local size
+        size="$(du -sh "$shadow" 2>/dev/null | cut -f1 | xargs)"
+        local state=""
+        [[ -d "$source/.git" ]] || state=" [gone]"
+
+        printf "  %-35s %-6s %s%s\n" "$name" "$size" "$source" "$state"
+    done
+
+    $found || info "no shadow repos found"
+}
+
+cmd_shell_init() {
+    cat <<'SHELL'
+# git-shadow: transparent git init wrapping
+git() {
+    if [[ "${1:-}" == "init" ]]; then
+        shift
+        command git shadow init "$@"
+    else
+        command git "$@"
+    fi
+}
+SHELL
+}
+
+case "${1:-}" in
+    init)       shift; cmd_init "$@" ;;
+    enable)     cmd_enable ;;
+    disable)    cmd_disable ;;
+    status)     cmd_status ;;
+    list)       cmd_list ;;
+    shell-init) cmd_shell_init ;;
+    -h|--help|help) usage ;;
+    "")         usage ;;
+    *)          die "unknown command: $1" ;;
+esac
